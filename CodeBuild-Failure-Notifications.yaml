@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: This template sends an SNS notification any CodeBuild deployments fail
+Parameters:
+  EmailSubscriptionAddress:
+    Type: String
+    Default: EMAIL_ADDRESS
+    Description: The email address you want to subscribe to the topic
+
+  KMSKeyAdministratorRoleARN:
+    Type: String
+    Default: <ARN>
+    Description: The ARN of the role that you want to administer the SNS Topic KMS Key
+
+  SNSCustomisationRoleArn:
+    Type: String
+    Default: <ARN>
+    Description: The ARN of the role that has logging and SNS publishing permissions 
+
+  SNSCustomisationRoleName:
+    Type: String
+    Default: SNS-Customisation-Lambda-Role
+    Description: The ARN of the role that has logging and SNS publishing permissions 
+
+  SNSTopic:
+    Type: String
+    Default: <ARN>
+    Description: The ARN of the SNS topic you want to publish failure notifications to 
+
+Resources: 
+  SNSKMSKey:
+    Type: AWS::KMS::Key
+    Properties: 
+      Description: KMS key to protect SNS topics
+      Enabled: true
+      EnableKeyRotation: true
+      KeyUsage: ENCRYPT_DECRYPT
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Statement:
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS: !Ref KMSKeyAdministratorRoleARN
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow Customisation Lambda to use Key 
+            Effect: Allow
+            Principal: 
+              AWS: !Ref SNSCustomisationRoleArn
+            Action: 
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey
+            Resource: '*'
+
+  EventRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "Events rule to trigger SNS notification on Code Build state changes to FAIL"
+      EventPattern:
+        source: 
+          - "aws.codebuild"
+        detail-type: 
+          - "CodeBuild Build State Change"
+        detail: 
+          build-status: 
+            - "FAILED"
+      State: ENABLED
+      Targets: 
+        - Arn: !GetAtt SNSCustomisationLambda.Arn
+          Id: '1'
+          
+  EventTopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - events.amazonaws.com
+                - lambda.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: '*'
+      Topics:
+        - !Ref SNSTopic
+
+  SNSCustomisationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Lambda function to customise SNS notifications 
+      Code:
+        ZipFile: !Sub 
+        - |
+          import boto3
+          def handler(event, context):
+              print(event)
+
+              project_name = event['detail']['project-name']
+              region = event['region']
+
+              subject = f"Dash CodeBuild Failure Notification"
+              message = f"{project_name} CodeBuild has failed in {region}"
+
+              client = boto3.client('sns')
+              response = client.publish(
+                  TargetArn="${SNSTopic}",
+                  Message=message,
+                  MessageStructure='text',
+                  Subject=subject,
+              )
+        - {SNSTopic: !Ref SNSTopic}
+
+      FunctionName: Code-Build-SNS-Customistion-Lambda-Function
+      Role: !Ref SNSCustomisationRoleArn
+      Runtime: python3.7
+      Handler: index.handler
+      Timeout: 7 #seconds
+
+  LambdaExecutionPolicy:
+    Type: AWS::IAM::Policy
+    Properties: 
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action: 'sns:Publish'
+          Resource: !Ref SNSTopic
+        - Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource: arn:aws:logs:*:*:*
+      PolicyName: SNS-CodeBuild-Failure-Publish
+      Roles: 
+        - !Ref SNSCustomisationRoleName
+
+  CloudWatchInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SNSCustomisationLambda
+      Principal: events.amazonaws.com
+      # SourceArn: !Ref EventTopicPolicy
